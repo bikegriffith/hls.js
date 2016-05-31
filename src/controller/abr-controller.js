@@ -193,6 +193,8 @@ class AbrController extends EventHandler {
 
     const v = hls.media,
           frag = this.fragCurrent,
+          currentLevel = frag.level,
+          avgDuration = ((hls.levels && hls.levels.length && (currentLevel >= 0) && (currentLevel < hls.levels.length)) ? hls.levels[currentLevel].details.averagetargetduration : frag.duration),
           pos = (v ? v.currentTime : 0),
           lastbw = this.bwEstimator.getEstimate(),
 
@@ -205,22 +207,22 @@ class AbrController extends EventHandler {
 
           // targetMinBuffered is the wall-clock time of two segments' worth of media. We aim to maintain this
           // much buffered data (minimum) while choosing the next level.
-          targetMinBuffered = 2 * frag.duration / playbackRate,
+          targetMinBuffered = 2 * frag.avgDuration / playbackRate,
 
           // availableFetchTime is how much "free time" we have to load the next segment in order to preserve
           // the minimum amount of buffered data. This can be negative, meaning we're below our target minimum
           // buffered threshold.
           availableFetchTime = bufferStarvationDelay - targetMinBuffered;
 
-    logger.log(`bufferStarvationDelay/targetMinBuffered/availableFetchTime: ${bufferStarvationDelay}/${targetMinBuffered}/${availableFetchTime}`);
+    logger.trace(`bufferStarvationDelay/targetMinBuffered/availableFetchTime: ${bufferStarvationDelay}/${targetMinBuffered}/${availableFetchTime}`);
 
     // If availableFetchTime is positive, we have a relatively easy choice to make -- find the highest level
     // that can (most likely) be fetched in availableFetchTime seconds.
     if (availableFetchTime > 0) {
       for (let i = maxAutoLevel; i >= 0 ; i--) {
         const bitrate = levels[i].bitrate,
-              fetchTime = bitrate * frag.duration / lastbw;
-        logger.log(`level/bitrate/lastbw/fetchTime/return: ${i}/${bitrate}/${lastbw}/${fetchTime}/${fetchTime < availableFetchTime}`);
+              fetchTime = bitrate * avgDuration / lastbw;
+        logger.trace(`level/bitrate/lastbw/fetchTime/return: ${i}/${bitrate}/${lastbw}/${fetchTime}/${fetchTime < availableFetchTime}`);
         if (fetchTime < availableFetchTime) {
           return i;
         }
@@ -232,13 +234,13 @@ class AbrController extends EventHandler {
     // a level that can be fetched faster than playback so we build our buffer back up to targetMinBuffered.
     for (let i = maxAutoLevel; i >= 0 ; i--) {
       const bitrate = levels[i].bitrate,
-            fetchTime = bitrate * frag.duration / lastbw,
+            fetchTime = bitrate * avgDuration / lastbw,
 
-          // timeRecovered is the amount of buffered time that will be "recovered" assuming we're able to
-          // fetch the segment in the expected time.
-          timeRecovered = frag.duration - fetchTime;
+            // timeRecovered is the amount of buffered time that will be "recovered" assuming we're able to
+            // fetch the segment in the expected time.
+            timeRecovered = avgDuration - fetchTime;
 
-      logger.log(`level/bitrate/lastbw/fetchTime/timeRecovered/return: ${i}/${bitrate}/${lastbw}/${fetchTime}/${timeRecovered}/${availableFetchTime + timeRecovered > 0}`);
+      logger.trace(`level/bitrate/lastbw/fetchTime/timeRecovered/return: ${i}/${bitrate}/${lastbw}/${fetchTime}/${timeRecovered}/${availableFetchTime + timeRecovered > 0}`);
       if (0.5 * availableFetchTime + timeRecovered > 0) {
         return i;
       }
