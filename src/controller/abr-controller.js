@@ -207,7 +207,7 @@ class AbrController extends EventHandler {
 
           // targetMinBuffered is the wall-clock time of two segments' worth of media. We aim to maintain this
           // much buffered data (minimum) while choosing the next level.
-          targetMinBuffered = 2 * frag.avgDuration / playbackRate,
+          targetMinBuffered = 2 * avgDuration / playbackRate,
 
           // availableFetchTime is how much "free time" we have to load the next segment in order to preserve
           // the minimum amount of buffered data. This can be negative, meaning we're below our target minimum
