@@ -442,9 +442,9 @@ var AbrController = function (_EventHandler) {
           var hls = this.hls,
               level = data.frag.level,
               isLive = hls.levels[level].details.live,
-              config = hls.config,
-              ewmaFast = void 0,
-              ewmaSlow = void 0;
+              config = hls.config;
+          var ewmaFast = undefined,
+              ewmaSlow = undefined;
 
           if (isLive) {
             ewmaFast = config.abrEwmaFastLive;
@@ -496,8 +496,8 @@ var AbrController = function (_EventHandler) {
           // time to finish loading current fragment is bigger than buffer starvation delay
           // ie if we risk buffer starvation if bw does not increase quickly
           if (bufferStarvationDelay < 2 * frag.duration / playbackRate && fragLoadedDelay > bufferStarvationDelay) {
-            var fragLevelNextLoadedDelay = void 0,
-                nextLoadLevel = void 0;
+            var fragLevelNextLoadedDelay = undefined,
+                nextLoadLevel = undefined;
             // lets iterate through lower level and try to find the biggest one that could avoid rebuffering
             // we start from current level - 1 and we step down , until we find a matching level
             for (nextLoadLevel = frag.level - 1; nextLoadLevel >= 0; nextLoadLevel--) {
@@ -591,11 +591,8 @@ var AbrController = function (_EventHandler) {
     key: 'nextAutoLevel',
     get: function get() {
       var hls = this.hls,
-          config = hls.config,
-          levels = hls.levels,
-          v = hls.media,
-          i = void 0,
-          maxAutoLevel = void 0;
+          levels = hls.levels;
+      var maxAutoLevel = undefined;
       if (this._autoLevelCapping === -1 && levels && levels.length) {
         maxAutoLevel = levels.length - 1;
       } else {
@@ -606,26 +603,71 @@ var AbrController = function (_EventHandler) {
       if (this._nextAutoLevel !== -1) {
         return Math.min(this._nextAutoLevel, maxAutoLevel);
       }
-      var playbackRate = v && v.playbackRate !== 0 ? Math.abs(v.playbackRate) : 1.0,
-          avgbw = this.bwEstimator ? this.bwEstimator.getEstimate() / playbackRate : config.abrEwmaDefaultEstimate / playbackRate,
-          adjustedbw = void 0;
-      // follow algorithm captured from stagefright :
-      // https://android.googlesource.com/platform/frameworks/av/+/master/media/libstagefright/httplive/LiveSession.cpp
-      // Pick the highest bandwidth stream below or equal to estimated bandwidth.
-      for (i = 0; i <= maxAutoLevel; i++) {
-        // consider only 80% of the available bandwidth, but if we are switching up,
-        // be even more conservative (70%) to avoid overestimating and immediately
-        // switching back.
-        if (i <= this.lastLoadedFragLevel) {
-          adjustedbw = config.abrBandWidthFactor * avgbw;
-        } else {
-          adjustedbw = config.abrBandWidthUpFactor * avgbw;
-        }
-        if (adjustedbw < levels[i].bitrate) {
-          return Math.max(0, i - 1);
+
+      var v = hls.media,
+          frag = this.fragCurrent,
+          currentLevel = frag.level,
+          avgDuration = hls.levels && hls.levels.length && currentLevel >= 0 && currentLevel < hls.levels.length ? hls.levels[currentLevel].details.averagetargetduration : frag.duration,
+          pos = v ? v.currentTime : 0,
+          lastbw = this.bwEstimator.getEstimate(),
+
+
+      // playbackRate is the absolute value of the playback rate; if v.playbackRate is 0, we use 1 to load as
+      // if we're playing back at the normal rate.
+      playbackRate = v && v.playbackRate !== 0 ? Math.abs(v.playbackRate) : 1.0,
+
+
+      // bufferStarvationDelay is the wall-clock time left until the playback buffer is exhausted.
+      bufferStarvationDelay = (_bufferHelper2.default.bufferInfo(v, pos, hls.config.maxBufferHole).end - pos) / playbackRate,
+
+
+      // targetMinBuffered is the wall-clock time of two segments' worth of media. We aim to maintain this
+      // much buffered data (minimum) while choosing the next level.
+      targetMinBuffered = 2 * avgDuration / playbackRate,
+
+
+      // availableFetchTime is how much "free time" we have to load the next segment in order to preserve
+      // the minimum amount of buffered data. This can be negative, meaning we're below our target minimum
+      // buffered threshold.
+      availableFetchTime = bufferStarvationDelay - targetMinBuffered;
+
+      _logger.logger.trace('bufferStarvationDelay/targetMinBuffered/availableFetchTime: ' + bufferStarvationDelay + '/' + targetMinBuffered + '/' + availableFetchTime);
+
+      // If availableFetchTime is positive, we have a relatively easy choice to make -- find the highest level
+      // that can (most likely) be fetched in availableFetchTime seconds.
+      if (availableFetchTime > 0) {
+        for (var i = maxAutoLevel; i >= 0; i--) {
+          var bitrate = levels[i].bitrate,
+              fetchTime = bitrate * avgDuration / lastbw;
+          _logger.logger.trace('level/bitrate/lastbw/fetchTime/return: ' + i + '/' + bitrate + '/' + lastbw + '/' + fetchTime + '/' + (fetchTime < availableFetchTime));
+          if (fetchTime < availableFetchTime) {
+            return i;
+          }
         }
       }
-      return i - 1;
+
+      // If we get here, then availableFetchTime is either negative or so small that we couldn't expect to
+      // fetch any of the levels in time. We don't necessarily have to switch down to zero, but should choose
+      // a level that can be fetched faster than playback so we build our buffer back up to targetMinBuffered.
+      for (var i = maxAutoLevel; i >= 0; i--) {
+        var bitrate = levels[i].bitrate,
+            fetchTime = bitrate * avgDuration / lastbw,
+
+
+        // timeRecovered is the amount of buffered time that will be "recovered" assuming we're able to
+        // fetch the segment in the expected time.
+        timeRecovered = avgDuration - fetchTime;
+
+        _logger.logger.trace('level/bitrate/lastbw/fetchTime/timeRecovered/return: ' + i + '/' + bitrate + '/' + lastbw + '/' + fetchTime + '/' + timeRecovered + '/' + (availableFetchTime + timeRecovered > 0));
+        if (0.5 * availableFetchTime + timeRecovered > 0) {
+          return i;
+        }
+      }
+
+      // If we get here, we're struggling to find a level that can be reasonably loaded in time. We'll return
+      // 0 as a last resort.
+      _logger.logger.warn('Unable to find a segment we can reasonably expect to fetch in time; returning level 0.');
+      return 0;
     },
     set: function set(nextLevel) {
       this._nextAutoLevel = nextLevel;
@@ -841,14 +883,14 @@ var AudioStreamController = function (_EventHandler) {
                 fragLen = fragments.length,
                 start = fragments[0].start,
                 end = fragments[fragLen - 1].start + fragments[fragLen - 1].duration,
-                frag = void 0;
+                frag = undefined;
 
             // if bufferEnd before start of playlist, load first fragment
             if (bufferEnd < start) {
               frag = fragments[0];
             } else {
               (function () {
-                var foundFrag = void 0;
+                var foundFrag = undefined;
                 var maxFragLookUpTolerance = config.maxFragLookUpTolerance;
                 if (bufferEnd < end) {
                   if (bufferEnd > end - maxFragLookUpTolerance) {
@@ -1117,7 +1159,7 @@ var AudioStreamController = function (_EventHandler) {
       var fragCurrent = this.fragCurrent;
       if (fragCurrent && data.id === 'audio' && data.sn === fragCurrent.sn && data.level === fragCurrent.level && this.state === State.PARSING) {
         var tracks = data.tracks,
-            track = void 0;
+            track = undefined;
 
         // include levelCodec in audio and video tracks
         track = tracks.audio;
@@ -2031,8 +2073,8 @@ var CapLevelController = function (_EventHandler) {
     key: 'getMaxLevel',
     value: function getMaxLevel(capLevelIndex) {
       var result = 0,
-          i = void 0,
-          level = void 0,
+          i = undefined,
+          level = undefined,
           mWidth = this.mediaWidth,
           mHeight = this.mediaHeight,
           lWidth = 0,
@@ -2069,7 +2111,7 @@ var CapLevelController = function (_EventHandler) {
   }, {
     key: 'mediaWidth',
     get: function get() {
-      var width = void 0;
+      var width = undefined;
       if (this.media) {
         width = this.media.width || this.media.clientWidth || this.media.offsetWidth;
         width *= this.contentScaleFactor;
@@ -2079,7 +2121,7 @@ var CapLevelController = function (_EventHandler) {
   }, {
     key: 'mediaHeight',
     get: function get() {
-      var height = void 0;
+      var height = undefined;
       if (this.media) {
         height = this.media.height || this.media.clientHeight || this.media.offsetHeight;
         height *= this.contentScaleFactor;
@@ -2450,8 +2492,8 @@ var LevelController = function (_EventHandler) {
 
       var details = data.details,
           hls = this.hls,
-          levelId = void 0,
-          level = void 0,
+          levelId = undefined,
+          level = undefined,
           levelError = false;
       // try to recover not fatal errors
       switch (details) {
@@ -2853,7 +2895,7 @@ var StreamController = function (_EventHandler) {
       }
 
       // if we have not yet loaded any fragment, start loading from start position
-      var pos = void 0;
+      var pos = undefined;
       if (this.loadedmetadata) {
         pos = media.currentTime;
       } else {
@@ -2863,7 +2905,7 @@ var StreamController = function (_EventHandler) {
       var level = hls.nextLoadLevel;
 
       // compute max Buffer Length that we could get from this load level, based on level bitrate. don't buffer more than 60 MB and more than 30s
-      var maxBufLen = void 0;
+      var maxBufLen = undefined;
       if (this.levels[level].hasOwnProperty('bitrate')) {
         maxBufLen = Math.max(8 * config.maxBufferSize / this.levels[level].bitrate, config.maxBufferLength);
         maxBufLen = Math.min(maxBufLen, config.maxMaxBufferLength);
@@ -2916,7 +2958,7 @@ var StreamController = function (_EventHandler) {
           start = fragments[0].start,
           end = fragments[fragLen - 1].start + fragments[fragLen - 1].duration,
           bufferEnd = bufferInfo.end,
-          frag = void 0;
+          frag = undefined;
 
       // in case of live playlist we need to ensure that requested position is not located before playlist start
       if (levelDetails.live) {
@@ -2952,7 +2994,7 @@ var StreamController = function (_EventHandler) {
 
       var config = this.hls.config;
 
-      var frag = void 0;
+      var frag = undefined;
 
       // check if requested position is within seekable boundaries :
       //logger.log(`start/pos/bufEnd/seeking:${start.toFixed(3)}/${pos.toFixed(3)}/${bufferEnd.toFixed(3)}/${this.media.seeking}`);
@@ -3017,8 +3059,8 @@ var StreamController = function (_EventHandler) {
 
       var config = this.hls.config;
 
-      var frag = void 0,
-          foundFrag = void 0,
+      var frag = undefined,
+          foundFrag = undefined,
           maxFragLookUpTolerance = config.maxFragLookUpTolerance;
 
       if (bufferEnd < end) {
@@ -3225,7 +3267,7 @@ var StreamController = function (_EventHandler) {
       if (!this.immediateSwitch) {
         this.immediateSwitch = true;
         var media = this.media,
-            previouslyPaused = void 0;
+            previouslyPaused = undefined;
         if (media) {
           previouslyPaused = media.paused;
           media.pause();
@@ -3277,9 +3319,9 @@ var StreamController = function (_EventHandler) {
       var media = this.media;
       // ensure that media is defined and that metadata are available (to retrieve currentTime)
       if (media && media.readyState) {
-        var fetchdelay = void 0,
-            currentRange = void 0,
-            nextRange = void 0;
+        var fetchdelay = undefined,
+            currentRange = undefined,
+            nextRange = undefined;
         // increase fragment load Index to avoid frag loop loading error after buffer flush
         this.fragLoadIdx += 2 * this.config.fragLoadingLoopThreshold;
         currentRange = this.getBufferRange(media.currentTime);
@@ -3720,8 +3762,8 @@ var StreamController = function (_EventHandler) {
     key: 'onBufferCreated',
     value: function onBufferCreated(data) {
       var tracks = data.tracks,
-          mediaTrack = void 0,
-          name = void 0,
+          mediaTrack = undefined,
+          name = undefined,
           alternate = false;
       for (var type in tracks) {
         var track = tracks[type];
@@ -5602,7 +5644,7 @@ var ExpGolomb = function () {
         // vui_parameters_present_flag
         if (this.readBoolean()) {
           // aspect_ratio_info_present_flag
-          var sarRatio = void 0;
+          var sarRatio = undefined;
           var aspectRatioIdc = this.readUByte();
           switch (aspectRatioIdc) {
             case 1:
@@ -5919,18 +5961,22 @@ var TSDemuxer = function () {
       this.videoCodec = videoCodec;
       this.timeOffset = timeOffset;
       this._duration = duration;
-      this.contiguous = false;
+      this.contiguous = null;
       if (cc !== this.lastCC) {
         _logger.logger.log('discontinuity detected');
         this.insertDiscontinuity();
         this.lastCC = cc;
+        this.contiguous = false;
       }
       if (level !== this.lastLevel) {
         _logger.logger.log('level switch detected');
         this.switchLevel();
         this.lastLevel = level;
-      } else if (sn === this.lastSN + 1) {
+        this.contiguous = false;
+      } else if (sn === this.lastSN + 1 && this.contiguous === null) {
         this.contiguous = true;
+      } else {
+        this.contiguous = false;
       }
       this.lastSN = sn;
 
@@ -6273,22 +6319,21 @@ var TSDemuxer = function () {
             var payloadType = 0;
             var payloadSize = 0;
             var endOfCaptions = false;
+            var b = 0;
 
             while (!endOfCaptions && expGolombDecoder.bytesAvailable > 1) {
               payloadType = 0;
               do {
-                if (expGolombDecoder.bytesAvailable !== 0) {
-                  payloadType += expGolombDecoder.readUByte();
-                }
-              } while (payloadType === 0xFF);
+                b = expGolombDecoder.readUByte();
+                payloadType += b;
+              } while (b === 0xFF);
 
               // Parse payload size.
               payloadSize = 0;
               do {
-                if (expGolombDecoder.bytesAvailable !== 0) {
-                  payloadSize += expGolombDecoder.readUByte();
-                }
-              } while (payloadSize === 0xFF);
+                b = expGolombDecoder.readUByte();
+                payloadSize += b;
+              } while (b === 0xFF);
 
               // TODO: there can be more than one payload in an SEI packet...
               // TODO: need to read type and size in a while loop to get them all
@@ -6478,19 +6523,19 @@ var TSDemuxer = function () {
                 // If NAL units are not starting right at the beginning of the PES packet, push preceding data into previous NAL unit.
                 overflow = i - state - 1;
                 if (overflow > 0) {
-                  var _track = this._avcTrack,
-                      _samples = _track.samples;
+                  var track = this._avcTrack,
+                      samples = track.samples;
                   //logger.log('first NALU found with overflow:' + overflow);
-                  if (_samples.length) {
-                    var _lastavcSample = _samples[_samples.length - 1],
-                        _lastUnits = _lastavcSample.units.units,
-                        _lastUnit = _lastUnits[_lastUnits.length - 1],
-                        tmp = new Uint8Array(_lastUnit.data.byteLength + overflow);
-                    tmp.set(_lastUnit.data, 0);
-                    tmp.set(array.subarray(0, overflow), _lastUnit.data.byteLength);
-                    _lastUnit.data = tmp;
-                    _lastavcSample.units.length += overflow;
-                    _track.len += overflow;
+                  if (samples.length) {
+                    var lastavcSample = samples[samples.length - 1],
+                        lastUnits = lastavcSample.units.units,
+                        lastUnit = lastUnits[lastUnits.length - 1],
+                        tmp = new Uint8Array(lastUnit.data.byteLength + overflow);
+                    tmp.set(lastUnit.data, 0);
+                    tmp.set(array.subarray(0, overflow), lastUnit.data.byteLength);
+                    lastUnit.data = tmp;
+                    lastavcSample.units.length += overflow;
+                    track.len += overflow;
                   }
                 }
               }
@@ -8102,7 +8147,7 @@ var PlaylistLoader = function (_EventHandler) {
     key: 'parseMasterPlaylist',
     value: function parseMasterPlaylist(string, baseurl) {
       var levels = [],
-          result = void 0;
+          result = undefined;
 
       // https://regex101.com is your friend
       var re = /#EXT-X-STREAM-INF:([^\n\r]*)[\r\n]+([^\r\n]+)/g;
@@ -8141,7 +8186,7 @@ var PlaylistLoader = function (_EventHandler) {
     key: 'parseMasterPlaylistMedia',
     value: function parseMasterPlaylistMedia(string, baseurl, type) {
       var medias = [],
-          result = void 0,
+          result = undefined,
           id = 0;
 
       // https://regex101.com is your friend
@@ -9059,14 +9104,14 @@ var MP4Remuxer = function () {
           var audioData = this.remuxAudio(audioTrack, timeOffset, contiguous);
           //logger.log('nb AVC samples:' + videoTrack.samples.length);
           if (videoTrack.samples.length) {
-            var audioTrackLength = void 0;
+            var audioTrackLength = undefined;
             if (audioData) {
               audioTrackLength = audioData.endPTS - audioData.startPTS;
             }
             this.remuxVideo(videoTrack, timeOffset, contiguous, audioTrackLength);
           }
         } else {
-          var videoData = void 0;
+          var videoData = undefined;
           //logger.log('nb AVC samples:' + videoTrack.samples.length);
           if (videoTrack.samples.length) {
             videoData = this.remuxVideo(videoTrack, timeOffset, contiguous);
@@ -9182,7 +9227,7 @@ var MP4Remuxer = function () {
 
       // PTS is coded on 33bits, and can loop from -2^32 to 2^32
       // PTSNormalize will make PTS/DTS value monotonic, we use last known DTS value as reference value
-      var nextAvcDts = void 0;
+      var nextAvcDts = undefined;
       if (contiguous) {
         // if parsed fragment is contiguous with last one, let's use last DTS value as reference
         nextAvcDts = this.nextAvcDts;
@@ -9260,10 +9305,10 @@ var MP4Remuxer = function () {
       view.setUint32(0, mdat.byteLength);
       mdat.set(_mp4Generator2.default.types.mdat, 4);
 
-      for (var _i = 0; _i < inputSamples.length; _i++) {
-        var avcSample = inputSamples[_i],
+      for (var i = 0; i < inputSamples.length; i++) {
+        var avcSample = inputSamples[i],
             mp4SampleLength = 0,
-            compositionTimeOffset = void 0;
+            compositionTimeOffset = undefined;
         // convert NALU bitstream to MP4 format (prepend NALU with size field)
         while (avcSample.units.units.length) {
           var unit = avcSample.units.units.shift();
@@ -9276,11 +9321,11 @@ var MP4Remuxer = function () {
 
         if (!isSafari) {
           // expected sample duration is the Decoding Timestamp diff of consecutive samples
-          if (_i < inputSamples.length - 1) {
-            mp4SampleDuration = inputSamples[_i + 1].dts - avcSample.dts;
+          if (i < inputSamples.length - 1) {
+            mp4SampleDuration = inputSamples[i + 1].dts - avcSample.dts;
           } else {
             var config = this.config,
-                lastFrameDuration = avcSample.dts - inputSamples[_i > 0 ? _i - 1 : _i].dts;
+                lastFrameDuration = avcSample.dts - inputSamples[i > 0 ? i - 1 : i].dts;
             if (config.stretchShortVideoTrack) {
               // In some cases, a segment's audio track duration may exceed the video track duration.
               // Since we've already remuxed audio, and we know how long the audio track is, we look to
@@ -9384,7 +9429,9 @@ var MP4Remuxer = function () {
           ptsnorm,
           dtsnorm,
           samples = [],
-          samples0 = [];
+          samples0 = [],
+          fillFrame,
+          newStamp;
 
       track.samples.sort(function (a, b) {
         return a.pts - b.pts;
@@ -9398,10 +9445,9 @@ var MP4Remuxer = function () {
       // In an effort to prevent this from happening, we inject frames here where there are gaps.
       // When possible, we inject a silent frame; when that's not possible, we duplicate the last
       // frame.
-      var firstPtsNorm = this._PTSNormalize(samples0[0].pts - this._initPTS, nextAacPts),
-          pesFrameDuration = expectedSampleDuration * pes2mp4ScaleFactor;
-      var nextPtsNorm = firstPtsNorm + pesFrameDuration;
-      for (var i = 1; i < samples0.length;) {
+      var pesFrameDuration = expectedSampleDuration * pes2mp4ScaleFactor;
+      var nextPtsNorm = nextAacPts;
+      for (var i = 0; i < samples0.length;) {
         // First, let's see how far off this frame is from where we expect it to be
         var sample = samples0[i],
             ptsNorm = this._PTSNormalize(sample.pts - this._initPTS, nextAacPts),
@@ -9419,8 +9465,9 @@ var MP4Remuxer = function () {
             var missing = Math.round(delta / pesFrameDuration);
             _logger.logger.log('Injecting ' + missing + ' frame' + (missing > 1 ? 's' : '') + ' of missing audio due to ' + Math.round(delta / 90) + ' ms gap.');
             for (var j = 0; j < missing; j++) {
-              var newStamp = samples0[i - 1].pts + pesFrameDuration,
-                  fillFrame = _aac2.default.getSilentFrame(track.channelCount);
+              newStamp = sample.pts - (missing - j) * pesFrameDuration;
+              newStamp = Math.max(newStamp, this._initPTS);
+              fillFrame = _aac2.default.getSilentFrame(track.channelCount);
               if (!fillFrame) {
                 _logger.logger.log('Unable to get silent frame for given audio codec; duplicating last frame instead.');
                 fillFrame = sample.unit.slice(0);
@@ -9431,8 +9478,8 @@ var MP4Remuxer = function () {
             }
 
             // Adjust sample to next expected pts
-            nextPtsNorm += (missing + 1) * pesFrameDuration;
             sample.pts = samples0[i - 1].pts + pesFrameDuration;
+            nextPtsNorm = this._PTSNormalize(sample.pts + pesFrameDuration - this._initPTS, nextAacPts);
             i += 1;
           }
           // Otherwise, we're within half a frame duration, so just adjust pts
@@ -9441,7 +9488,11 @@ var MP4Remuxer = function () {
                 _logger.logger.log('Invalid frame delta ' + (ptsNorm - nextPtsNorm + pesFrameDuration) + ' at PTS ' + Math.round(ptsNorm / 90) + ' (should be ' + pesFrameDuration + ').');
               }
               nextPtsNorm += pesFrameDuration;
-              sample.pts = samples0[i - 1].pts + pesFrameDuration;
+              if (i === 0) {
+                sample.pts = this._initPTS + nextAacPts;
+              } else {
+                sample.pts = samples0[i - 1].pts + pesFrameDuration;
+              }
               i += 1;
             }
       }
@@ -9460,13 +9511,22 @@ var MP4Remuxer = function () {
         } else {
           ptsnorm = this._PTSNormalize(pts, nextAacPts);
           dtsnorm = this._PTSNormalize(dts, nextAacPts);
-          var _delta = Math.round(1000 * (ptsnorm - nextAacPts) / pesTimeScale);
+          var _delta = Math.round(1000 * (ptsnorm - nextAacPts) / pesTimeScale),
+              numMissingFrames = 0;
           // if fragment are contiguous, detect hole/overlapping between fragments
           if (contiguous) {
             // log delta
             if (_delta) {
               if (_delta > 0) {
+                numMissingFrames = Math.round((ptsnorm - nextAacPts) / pesFrameDuration);
                 _logger.logger.log(_delta + ' ms hole between AAC samples detected,filling it');
+                if (numMissingFrames > 0) {
+                  fillFrame = _aac2.default.getSilentFrame(track.channelCount);
+                  if (!fillFrame) {
+                    fillFrame = unit.slice(0);
+                  }
+                  track.len += numMissingFrames * fillFrame.length;
+                }
                 // if we have frame overlap, overlapping for more than half a frame duraion
               } else if (_delta < -12) {
                   // drop overlapping audio frames... browser will deal with it
@@ -9491,6 +9551,29 @@ var MP4Remuxer = function () {
           } else {
             // no audio samples
             return;
+          }
+          for (i = 0; i < numMissingFrames; i++) {
+            newStamp = ptsnorm - (numMissingFrames - i) * pesFrameDuration;
+            fillFrame = _aac2.default.getSilentFrame(track.channelCount);
+            if (!fillFrame) {
+              _logger.logger.log('Unable to get silent frame for given audio codec; duplicating this frame instead.');
+              fillFrame = unit.slice(0);
+            }
+            mdat.set(fillFrame, offset);
+            offset += fillFrame.byteLength;
+            mp4Sample = {
+              size: fillFrame.byteLength,
+              cts: 0,
+              duration: 0,
+              flags: {
+                isLeading: 0,
+                isDependedOn: 0,
+                hasRedundancy: 0,
+                degradPrio: 0,
+                dependsOn: 1
+              }
+            };
+            samples.push(mp4Sample);
           }
         }
         mdat.set(unit, offset);
@@ -9553,8 +9636,8 @@ var MP4Remuxer = function () {
 
 
       // sync with video's timestamp
-      startDTS = videoData.startDTS * pesTimeScale,
-          endDTS = videoData.endDTS * pesTimeScale,
+      startDTS = videoData.startDTS * pesTimeScale + this._initDTS,
+          endDTS = videoData.endDTS * pesTimeScale + this._initDTS,
 
 
       // one sample's duration value
